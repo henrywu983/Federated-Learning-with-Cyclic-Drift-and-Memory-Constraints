@@ -27,11 +27,11 @@ sys.argv = [
     '--learning_rate', '0.001',
     '--epochs', '3',
     '--batch_size', '64',
-    '--num_users', '10',
+    '--num_users', '20',
     '--fraction', '0.1',
     '--transmission_probability', '0.1',
     '--num_slots', '10',
-    '--num_timeframes', '223',
+    '--num_timeframes', '373',
     '--user_data_size', '1500',
     '--seeds', '56',# '56', '3', '29', '85', '65',
     '--gamma_momentum', '0',
@@ -41,9 +41,9 @@ sys.argv = [
     '--num_runs', '5',
     '--slotted_aloha', 'false', # for the NeurIPS paper, we don't consider random access channel
     '--num_memory_cells', '4',
-    '--selected_mode', 'vanilla',
+    '--selected_mode', 'user_selection_softmax',
     '--cos_similarity', '2',
-    '--cycle', '3',
+    '--cycle', '5',
     '--train_mode', 'dense',
 ]
 
@@ -66,10 +66,10 @@ parser.add_argument('--phase', type=int, default=5,help='When concept drift happ
 parser.add_argument('--num_runs', type=int, default=5,help='Number of simulations')
 parser.add_argument('--slotted_aloha', type=str, default='true',help='Whether we use Slotted aloha in the simulation')
 parser.add_argument('--num_memory_cells', type=int, default=6,help='Number of memory cells per client')
-parser.add_argument('--selected_mode', type=str, default='vanilla',help='Which setting we are using: centralized, genie_aided, vanilla, user_selection_cos, user_selection_cos_dis, user_selection_acc, user_selection_acc_increment, user_selection_aoi')
+parser.add_argument('--selected_mode', type=str, default='vanilla',help='Which setting we are using: centralized, genie_aided, vanilla, user_selection_cos, user_selection_softmax')
 parser.add_argument('--cos_similarity', type=int, default=2,help='What type of cosine similarity we want to test: cos2 = 2, cos4 = 4, ...')
 parser.add_argument('--cycle', type=int, default=1,help='Number of cycles')
-parser.add_argument('--train_mode', type=str, default='all',help='Which part of network we are training: all, dense, conv')
+parser.add_argument('--train_mode', type=str, default='all',help='Which part of network we are training: all, dense, conv, last_block')
 
 args = parser.parse_args()
 
@@ -191,6 +191,17 @@ class ResNet18(nn.Module):
         elif train_mode == 'all':
             for param in self.parameters():
                 param.requires_grad = True
+
+        elif train_mode == 'last_block':
+            for param in self.features.parameters():
+                param.requires_grad = False
+            for param in self.features[7].parameters():
+                param.requires_grad = True
+            for param in self.classifier.parameters():
+                param.requires_grad = True
+        
+        else:
+            raise ValueError(f"Invalid train_mode: {train_mode}")
 
     def forward(self, x):
         x = self.features(x)
@@ -515,6 +526,7 @@ global_grad_mag = np.zeros((num_runs, len(seeds_for_avg), num_timeframes))
 
 # Adjust other relevant matrices similarly
 successful_users_record = np.zeros((num_runs, len(seeds_for_avg), num_timeframes))
+selected_users_record = np.zeros((num_runs, len(seeds_for_avg), num_timeframes, 3))
 loc_grad_mag = np.zeros((num_runs, len(seeds_for_avg), num_timeframes, num_users, num_users))
 loc_grad_mag_memory = np.zeros((num_runs, len(seeds_for_avg), num_timeframes, num_users, num_users))
 memory_matrix_mag = np.zeros((num_runs, len(seeds_for_avg), num_timeframes, num_users, num_users))
@@ -657,7 +669,7 @@ for run in range(num_runs):
         model = ResNet18(num_classes=num_classes).to(device)
         criterion = nn.CrossEntropyLoss()
         # optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-        optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9)
+        optimizer = optim.SGD((param for param in model.parameters() if param.requires_grad), lr=learning_rate, momentum=0.9)
 
         w_before_train = [param.data.clone() for param in model.parameters()]
 
@@ -811,11 +823,14 @@ for run in range(num_runs):
             fl_system = FederatedLearning(
             selected_mode, slotted_aloha, num_users, num_slots, sparse_gradient, tx_prob, 
             w_before_train, device, user_new_info_dict, current_round_user_data_info, prev_round_global_grad, 
-            grad_per_user, cos_similarity, user_accuracies, user_accuracies_increment
+            grad_per_user, cos_similarity, softmax_beta=8.0
             )
 
             # Run the FL mode and get updated weights
-            sum_terms, packets_received, num_distinct_users = fl_system.run()
+            if selected_mode == 'vanilla':
+                sum_terms, packets_received, num_distinct_users = fl_system.run()            
+            else:
+                sum_terms, packets_received, num_distinct_users, selected_users = fl_system.run()
 
             if num_distinct_users > 0:
                 new_weights = [w_before_train[i] + sum_terms[i] / num_distinct_users for i in range(len(w_before_train))]
@@ -857,6 +872,7 @@ for run in range(num_runs):
             correctly_received_packets_stats[run][seed_index][timeframe]['variance'] = 0
 
             successful_users_record[run, seed_index, timeframe] = packets_received
+            selected_users_record[run, seed_index, timeframe, :] = selected_users
 
             w_before_train = new_weights
             torch.cuda.empty_cache()
@@ -904,17 +920,26 @@ print(f"Final results saved to: {file_path}")
 
 # Save the number of successful users record to CSV
 successful_users_record_file_path = os.path.join(save_dir, 'successful_users_record.csv')
-# Open the file in write mode
-with open(successful_users_record_file_path, 'w') as f:
-    # Write the header row
-    f.write('Run,Seed,Timeframe,Best Packets Received\n')
 
-    # Iterate over runs, seeds, and timeframes to write the best packets received
+with open(successful_users_record_file_path, 'w') as f:
+    f.write(
+        'Run,Seed,Timeframe,Best Packets Received,'
+        'Selected User 1,Selected User 2,Selected User 3\n'
+    )
+
     for run in range(num_runs):
         for seed_index, seed in enumerate(seeds_for_avg):
             for timeframe in range(num_timeframes):
                 best_packets_received = successful_users_record[run, seed_index, timeframe]
-                f.write(f'{run},{seed},{timeframe + 1},{best_packets_received}\n')
+
+                selected_user_1 = selected_users_record[run, seed_index, timeframe, 0]
+                selected_user_2 = selected_users_record[run, seed_index, timeframe, 1]
+                selected_user_3 = selected_users_record[run, seed_index, timeframe, 2]
+
+                f.write(
+                    f'{run},{seed},{timeframe + 1},{best_packets_received},'
+                    f'{selected_user_1},{selected_user_2},{selected_user_3}\n'
+                )
 
 print(f"Successful users record saved to: {successful_users_record_file_path}")
 
